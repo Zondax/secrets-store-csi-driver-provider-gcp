@@ -33,6 +33,8 @@ onto when authenticating to the Google Secret Manager API. For this to work the
 workload identity of the pod must be configured and appropriate IAM bindings
 must be applied.
 
+### Standard Workload Identity
+
 * Setup the workload identity service account.
 
 ```shell
@@ -47,6 +49,12 @@ $ gcloud iam service-accounts add-iam-policy-binding \
     --member "serviceAccount:$PROJECT_ID.svc.id.goog[default/mypodserviceaccount]" \
     gke-workload@$PROJECT_ID.iam.gserviceaccount.com
 ```
+
+### Generic Workload Identity Federation
+
+From version X.Y.Z, the provider supports generic Workload Identity Federation for non-GKE and non-Fleet clusters. This allows you to use WIF with any Kubernetes cluster that supports Workload Identity Federation, such as EKS, AKS, or self-managed clusters.
+
+See the [Generic WIF documentation](docs/generic-wif.md) for details.
 
 * Create a secret that the workload identity service account can access
 

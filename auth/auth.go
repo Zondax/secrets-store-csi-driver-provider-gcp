@@ -96,6 +96,15 @@ func (c *Client) TokenSource(ctx context.Context, cfg *config.MountConfig) (oaut
 		return oauth2.StaticTokenSource(token), nil
 	}
 
+	if cfg.AuthGenericWIF {
+		klog.InfoS("using generic WIF for authentication")
+		token, err := c.Token(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("unable to obtain generic workload identity federation auth: %v", err)
+		}
+		return oauth2.StaticTokenSource(token), nil
+	}
+
 	return nil, errors.New("mount configuration has no auth method configured")
 }
 
@@ -121,15 +130,30 @@ func (c *Client) TokenSource(ctx context.Context, cfg *config.MountConfig) (oaut
 // in driver spec, the provider does not receive any tokens from driver and generates
 // its own token. Token creation can be removed once driver implements the requiresRepublish.
 func (c *Client) Token(ctx context.Context, cfg *config.MountConfig) (*oauth2.Token, error) {
-
 	var audience string
-	idPool, idProvider, err := c.gkeWorkloadIdentity(ctx, cfg)
-	if err != nil {
-		idPool, idProvider, audience, err = c.fleetWorkloadIdentity(ctx, cfg)
+	var idPool, idProvider string
+	var err error
+
+	if cfg.AuthGenericWIF {
+		idPool, idProvider, audience, err = c.genericWIFAuth(ctx, cfg)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("generic WIF authentication failed: %w", err)
+		}
+		klog.InfoS("generic WIF authentication successful",
+			"idPool", idPool,
+			"idProvider", idProvider,
+			"audience", audience,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	} else {
+		idPool, idProvider, err = c.gkeWorkloadIdentity(ctx, cfg)
+		if err != nil {
+			idPool, idProvider, audience, err = c.fleetWorkloadIdentity(ctx, cfg)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
+
 	if audience == "" {
 		audience = fmt.Sprintf("identitynamespace:%s:%s", idPool, idProvider)
 		klog.V(5).InfoS("workload id configured", "pool", idPool, "provider", idProvider)
@@ -335,4 +359,82 @@ func tradeIDBindToken(ctx context.Context, client *http.Client, k8sToken, audien
 		return nil, err
 	}
 	return idBindToken, nil
+}
+
+func (c *Client) genericWIFAuth(ctx context.Context, cfg *config.MountConfig) (string, string, string, error) {
+	klog.InfoS("starting generic WIF authentication",
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
+	// Check for required configuration
+	audience, ok := cfg.WIFConfig["audience"]
+	if !ok {
+		klog.ErrorS(nil, "missing required 'wif.audience' configuration for generic WIF",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+		return "", "", "", fmt.Errorf("missing required 'wif.audience' configuration for generic WIF")
+	}
+
+	klog.InfoS("using WIF audience from configuration",
+		"audience", audience,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
+	// Handle different audience formats
+	// Format 1: Direct audience string for Workload Identity Federation pools
+	// Format 2: identitynamespace:<idPool>:<idProvider>
+	var idPool, idProvider string
+
+	if strings.HasPrefix(audience, "identitynamespace:") {
+		// Try to parse the audience string in the standard format
+		split := strings.SplitN(audience, ":", 3)
+		if len(split) >= 3 {
+			idPool = split[1]
+			idProvider = split[2]
+			klog.InfoS("parsed identity namespace components from audience",
+				"idPool", idPool,
+				"idProvider", idProvider,
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+			return idPool, idProvider, "", nil
+		}
+	}
+
+	// If not in standard format, use it directly as audience
+	// Expect format like "//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID"
+	klog.InfoS("using audience as-is for WIF",
+		"audience", audience,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
+	// For debugging/telemetry, log credential source if provided
+	if credSource, ok := cfg.WIFConfig["credential_source"]; ok {
+		klog.InfoS("credential source specified for generic WIF",
+			"credential_source", credSource,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	}
+
+	// Get token URL from config or use default
+	tokenURL := cfg.WIFConfig["token_url"]
+	if tokenURL == "" {
+		tokenURL = "https://sts.googleapis.com/v1/token"
+		klog.InfoS("using default token URL for generic WIF",
+			"token_url", tokenURL,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	} else {
+		klog.InfoS("using configured token URL for generic WIF",
+			"token_url", tokenURL,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	}
+
+	// Override environment variable if provided
+	if envVarName, ok := cfg.WIFConfig["env_var"]; ok {
+		envVarVal := os.Getenv(envVarName)
+		if envVarVal != "" {
+			klog.InfoS("found environment variable for generic WIF",
+				"env_var", envVarName,
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+		} else {
+			klog.ErrorS(nil, "environment variable specified but not found",
+				"env_var", envVarName,
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+		}
+	}
+
+	return "", "", audience, nil
 }

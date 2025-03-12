@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/GoogleCloudPlatform/secrets-store-csi-driver-provider-gcp/vars"
 	"gopkg.in/yaml.v3"
@@ -84,6 +85,13 @@ type MountConfig struct {
 	// Google credential (parseable by google.CredentialsFromJSON).
 	AuthNodePublishSecret bool
 	AuthKubeSecret        []byte
+	// AuthGenericWIF identifies whether the Generic Workload Identity Federation
+	// should be used for authentication. This allows support for non-GKE and non-Fleet
+	// clusters using Workload Identity Federation.
+	AuthGenericWIF bool
+	// WIFConfig contains additional configuration options for Workload Identity Federation
+	// when using the generic-wif auth method.
+	WIFConfig map[string]string
 }
 
 // MountParams hold unparsed arguments from the CSI Driver from the mount event.
@@ -159,6 +167,22 @@ func Parse(in *MountParams) (*MountConfig, error) {
 			return nil, fmt.Errorf("attempting to set both nodePublishSecretRef and pod-adc auth")
 		}
 		out.AuthPodADC = true
+	case "generic-wif":
+		if out.AuthNodePublishSecret {
+			klog.InfoS("attempting to set both nodePublishSecretRef and generic-wif auth", "pod", podInfo)
+			return nil, fmt.Errorf("attempting to set both nodePublishSecretRef and generic-wif auth")
+		}
+		out.AuthGenericWIF = true
+		// Extract any WIF specific config options
+		out.WIFConfig = make(map[string]string)
+		for key, val := range attrib {
+			if strings.HasPrefix(key, "wif.") {
+				configKey := strings.TrimPrefix(key, "wif.")
+				out.WIFConfig[configKey] = val
+				klog.V(5).InfoS("parsed WIF config option", "key", configKey, "value", val, "pod", podInfo)
+			}
+		}
+		klog.InfoS("using generic WIF authentication", "wif_config_keys", mapKeys(out.WIFConfig), "pod", podInfo)
 	case "":
 		// default to pod auth unless nodePublishSecret is set
 		out.AuthPodADC = !out.AuthNodePublishSecret
@@ -195,4 +219,13 @@ func Parse(in *MountParams) (*MountConfig, error) {
 	}
 
 	return out, nil
+}
+
+// mapKeys returns the keys of a map as a string slice.
+func mapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
