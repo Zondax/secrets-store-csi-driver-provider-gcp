@@ -1,0 +1,6 @@
+apiVersion: v2
+name: generic-wif-example
+description: A simple example of using Generic WIF with Secret Store CSI Driver Provider for GCP
+type: application
+version: 0.1.0
+appVersion: "1.0.0" 

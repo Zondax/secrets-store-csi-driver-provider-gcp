@@ -1,0 +1,48 @@
+## Application configuration
+replicaCount: 1
+
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+## ServiceAccount configuration
+serviceAccount:
+  create: true
+  name: "generic-wif-app-sa"
+  annotations:
+    # If using GCP service account impersonation, uncomment and set this
+    # iam.gke.io/gcp-service-account: "gcp-sa@my-project.iam.gserviceaccount.com"
+
+## GCP Secret Manager configuration
+secrets:
+  projectId: "my-gcp-project"
+  # Generic WIF authentication configuration
+  wif:
+    # Required: WIF audience string - replace with your actual audience
+    audience: "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider"
+    # Optional: Override default token URL if needed
+    # tokenUrl: "https://sts.googleapis.com/v1/token"
+  # Secrets to mount
+  items:
+    - name: "app-config"
+      version: "latest"
+      path: "app-config.json"
+    - name: "app-credentials"
+      version: "latest"
+      path: "app-credentials.txt"
+      mode: 0400
+
+## Pod settings
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+## Application resource requests and limits
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi 
