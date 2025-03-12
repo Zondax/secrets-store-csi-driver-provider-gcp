@@ -58,6 +58,63 @@ Key log events include:
 - Token exchange attempts
 - Error conditions
 
+### Log Verbosity Levels
+
+The logging verbosity can be controlled to provide different levels of detail:
+
+- **Standard logs (level 0-2)**: Shows the main authentication flow steps and critical errors
+- **Detailed logs (level 3-4)**: Shows more information about token exchange, configuration details, and non-critical warnings
+- **Debug logs (level 5+)**: Shows verbose information useful for deep troubleshooting, including detailed token information
+
+### Key Log Points
+
+The provider logs detailed information at each stage of the authentication process:
+
+1. **Authentication Method Detection**:
+   ```
+   "starting token acquisition process" auth_mode="generic-wif" ...
+   ```
+
+2. **Configuration Parsing**:
+   ```
+   "generic WIF configuration parameters" available_params=map[audience:...] ...
+   ```
+
+3. **Audience Resolution**:
+   ```
+   "using audience as-is for WIF" audience="//iam.googleapis.com/..." ...
+   ```
+
+4. **Token Exchange Process**:
+   ```
+   "exchanging Kubernetes ServiceAccount token for GCP identity token" ...
+   "successfully obtained GCP identity token" token_expiry=... ...
+   ```
+
+5. **Service Account Impersonation** (if applicable):
+   ```
+   "exchanging identity token for GCP service account token" gcp_service_account="..." ...
+   ```
+
+### Troubleshooting with Logs
+
+When diagnosing issues, pay attention to these log patterns:
+
+- **Error logs**: Look for log entries with `level=error` which indicate failures in the authentication process
+- **Token exchange failures**: Check for HTTP status codes in the logs when token exchange fails
+- **Configuration issues**: The provider logs all available configuration parameters which can help identify missing or incorrect settings
+
+To enable more verbose logging, adjust the verbosity level when deploying the provider:
+
+```yaml
+# In the provider deployment
+spec:
+  containers:
+  - name: provider
+    args:
+    - "--v=4" # Increase this number for more detailed logs
+```
+
 ## Example Configuration
 
 Here's a complete example for setting up Generic WIF with GitHub Actions as the identity provider:

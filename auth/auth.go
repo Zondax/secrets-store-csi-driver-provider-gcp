@@ -134,9 +134,18 @@ func (c *Client) Token(ctx context.Context, cfg *config.MountConfig) (*oauth2.To
 	var idPool, idProvider string
 	var err error
 
+	klog.InfoS("starting token acquisition process",
+		"auth_mode", getAuthMode(cfg),
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 	if cfg.AuthGenericWIF {
+		klog.InfoS("using generic WIF authentication mode",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 		idPool, idProvider, audience, err = c.genericWIFAuth(ctx, cfg)
 		if err != nil {
+			klog.ErrorS(err, "generic WIF authentication failed",
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 			return nil, fmt.Errorf("generic WIF authentication failed: %w", err)
 		}
 		klog.InfoS("generic WIF authentication successful",
@@ -145,12 +154,31 @@ func (c *Client) Token(ctx context.Context, cfg *config.MountConfig) (*oauth2.To
 			"audience", audience,
 			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 	} else {
+		klog.InfoS("using standard workload identity mode",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 		idPool, idProvider, err = c.gkeWorkloadIdentity(ctx, cfg)
 		if err != nil {
+			klog.V(4).InfoS("GKE workload identity failed, trying fleet workload identity",
+				"error", err,
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 			idPool, idProvider, audience, err = c.fleetWorkloadIdentity(ctx, cfg)
 			if err != nil {
+				klog.ErrorS(err, "both GKE and fleet workload identity failed",
+					"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 				return nil, err
 			}
+			klog.InfoS("fleet workload identity configuration detected",
+				"idPool", idPool,
+				"idProvider", idProvider,
+				"audience", audience,
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+		} else {
+			klog.InfoS("GKE workload identity configuration detected",
+				"idPool", idPool,
+				"idProvider", idProvider,
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		}
 	}
 
@@ -161,56 +189,148 @@ func (c *Client) Token(ctx context.Context, cfg *config.MountConfig) (*oauth2.To
 		klog.V(5).InfoS("workload federation pool audience", audience)
 	}
 
+	klog.InfoS("audience determined for token exchange",
+		"audience", audience,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 	// Get iam.gke.io/gcp-service-account annotation to see if the
 	// identitybindingtoken token should be traded for a GCP SA token.
 	// See https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity#creating_a_relationship_between_ksas_and_gsas
+	klog.InfoS("retrieving ServiceAccount information from Kubernetes",
+		"namespace", cfg.PodInfo.Namespace,
+		"service_account", cfg.PodInfo.ServiceAccount,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 	saResp, err := c.KubeClient.
 		CoreV1().
 		ServiceAccounts(cfg.PodInfo.Namespace).
 		Get(ctx, cfg.PodInfo.ServiceAccount, v1.GetOptions{})
 	if err != nil {
+		klog.ErrorS(err, "failed to retrieve ServiceAccount information",
+			"namespace", cfg.PodInfo.Namespace,
+			"service_account", cfg.PodInfo.ServiceAccount,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		return nil, fmt.Errorf("unable to fetch SA info: %w", err)
 	}
+
 	gcpSA := saResp.Annotations["iam.gke.io/gcp-service-account"]
+	klog.InfoS("service account annotation check complete",
+		"k8s_service_account", cfg.PodInfo.ServiceAccount,
+		"gcp_service_account_annotation", gcpSA,
+		"has_gcp_sa_annotation", gcpSA != "",
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 	klog.V(5).InfoS("matched service account", "service_account", gcpSA)
 
 	// Obtain a serviceaccount token for the pod.
+	klog.InfoS("obtaining Kubernetes ServiceAccount token",
+		"service_account", cfg.PodInfo.ServiceAccount,
+		"namespace", cfg.PodInfo.Namespace,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
+		"has_driver_token", cfg.PodInfo.ServiceAccountTokens != "")
+
 	var saTokenVal string
 	if cfg.PodInfo.ServiceAccountTokens != "" {
+		klog.V(4).InfoS("extracting ServiceAccount token from driver-provided tokens",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 		saToken, err := c.extractSAToken(cfg, idPool, audience) // calling function to extract token received from driver.
 		if err != nil {
+			klog.ErrorS(err, "failed to extract ServiceAccount token from driver tokens",
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 			return nil, fmt.Errorf("unable to fetch SA token from driver: %w", err)
 		}
+
+		klog.InfoS("successfully extracted ServiceAccount token from driver",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
+			"token_expiration", saToken.ExpirationTimestamp)
+
 		saTokenVal = saToken.Token
 	} else {
+		klog.V(4).InfoS("generating new ServiceAccount token",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
+			"service_account", cfg.PodInfo.ServiceAccount,
+			"namespace", cfg.PodInfo.Namespace)
+
 		saToken, err := c.generatePodSAToken(ctx, cfg, idPool, audience) // if no token received, provider generates its own token.
 		if err != nil {
+			klog.ErrorS(err, "failed to generate ServiceAccount token",
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
+				"service_account", cfg.PodInfo.ServiceAccount)
 			return nil, fmt.Errorf("unable to fetch pod token: %w", err)
 		}
+
+		klog.InfoS("successfully generated new ServiceAccount token",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
+			"token_expiration", saToken.ExpirationTimestamp)
+
 		saTokenVal = saToken.Token
 	}
 
 	// Trade the kubernetes token for an identitybindingtoken token.
+	klog.InfoS("exchanging Kubernetes ServiceAccount token for GCP identity token",
+		"audience", audience,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 	idBindToken, err := tradeIDBindToken(ctx, c.HTTPClient, saTokenVal, audience)
 	if err != nil {
+		klog.ErrorS(err, "failed to exchange ServiceAccount token for identity token",
+			"audience", audience,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		return nil, fmt.Errorf("unable to fetch identitybindingtoken: %w", err)
 	}
+
+	klog.InfoS("successfully obtained GCP identity token",
+		"token_type", idBindToken.TokenType,
+		"token_expiry", idBindToken.Expiry,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 
 	// If no `iam.gke.io/gcp-service-account` annotation is present the
 	// identitybindingtoken will be used directly, allowing bindings on secrets
 	// of the form "serviceAccount:<project>.svc.id.goog[<namespace>/<sa>]".
 	if gcpSA == "" {
+		klog.InfoS("no GCP service account annotation found, using identity token directly",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		return idBindToken, nil
 	}
+
+	// Exchange identity token for GCP service account token
+	klog.InfoS("exchanging identity token for GCP service account token",
+		"gcp_service_account", gcpSA,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 
 	gcpSAResp, err := c.IAMClient.GenerateAccessToken(ctx, &credentialspb.GenerateAccessTokenRequest{
 		Name:  fmt.Sprintf("projects/-/serviceAccounts/%s", gcpSA),
 		Scope: secretmanager.DefaultAuthScopes(),
 	}, gax.WithGRPCOptions(grpc.PerRPCCredentials(oauth.TokenSource{TokenSource: oauth2.StaticTokenSource(idBindToken)})))
+
 	if err != nil {
+		klog.ErrorS(err, "failed to exchange identity token for GCP service account token",
+			"gcp_service_account", gcpSA,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		return nil, fmt.Errorf("unable to fetch gcp service account token: %w", err)
 	}
+
+	klog.InfoS("successfully obtained GCP service account token",
+		"gcp_service_account", gcpSA,
+		"token_expiry", gcpSAResp.GetExpireTime().AsTime(),
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+
 	return &oauth2.Token{AccessToken: gcpSAResp.GetAccessToken()}, nil
+}
+
+// Helper function to determine the auth mode string
+func getAuthMode(cfg *config.MountConfig) string {
+	if cfg.AuthGenericWIF {
+		return "generic-wif"
+	} else if cfg.AuthPodADC {
+		return "pod-adc"
+	} else if cfg.AuthProviderADC {
+		return "provider-adc"
+	} else if cfg.AuthNodePublishSecret {
+		return "node-publish-secret"
+	}
+	return "unknown"
 }
 
 func (c *Client) extractSAToken(cfg *config.MountConfig, idPool, audience string) (*authenticationv1.TokenRequestStatus, error) {
@@ -314,6 +434,18 @@ func (c *Client) fleetWorkloadIdentity(ctx context.Context, cfg *config.MountCon
 }
 
 func tradeIDBindToken(ctx context.Context, client *http.Client, k8sToken, audience string) (*oauth2.Token, error) {
+	tokenLen := 0
+	if k8sToken != "" {
+		tokenLen = len(k8sToken)
+		klog.V(4).InfoS("preparing to exchange k8s token for identity token",
+			"k8s_token_length", tokenLen,
+			"audience", audience)
+	} else {
+		klog.ErrorS(nil, "k8s token is empty, token exchange will fail")
+		return nil, fmt.Errorf("k8s token is empty")
+	}
+
+	// Prepare request body for token exchange
 	body, err := json.Marshal(map[string]string{
 		"grant_type":           "urn:ietf:params:oauth:grant-type:token-exchange",
 		"subject_token_type":   "urn:ietf:params:oauth:token-type:jwt",
@@ -323,53 +455,96 @@ func tradeIDBindToken(ctx context.Context, client *http.Client, k8sToken, audien
 		"scope":                "https://www.googleapis.com/auth/cloud-platform",
 	})
 	if err != nil {
+		klog.ErrorS(err, "failed to marshal token exchange request body")
 		return nil, err
 	}
 
 	identityBindingTokenEndPoint, err := vars.IdentityBindingTokenEndPoint.GetValue()
-
 	if err != nil {
+		klog.ErrorS(err, "failed to get identity binding token endpoint")
 		return nil, fmt.Errorf("unable to read identity binding token endpoint: %w", err)
 	}
 
+	klog.V(4).InfoS("sending token exchange request",
+		"endpoint", identityBindingTokenEndPoint,
+		"audience", audience,
+		"k8s_token_length", tokenLen)
+
 	req, err := http.NewRequestWithContext(ctx, "POST", identityBindingTokenEndPoint, bytes.NewBuffer(body))
 	if err != nil {
+		klog.ErrorS(err, "failed to create token exchange HTTP request")
 		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	gcpIamMetricRecorder := csrmetrics.OutboundRPCStartRecorder("gcp_iam_get_id_bind_token_requests")
+
+	// Start timer for measuring token exchange latency
+	startTime := time.Now()
 	resp, err := client.Do(req)
+	exchangeDuration := time.Since(startTime)
+
 	if err != nil {
+		klog.ErrorS(err, "token exchange HTTP request failed",
+			"duration_ms", exchangeDuration.Milliseconds(),
+			"endpoint", identityBindingTokenEndPoint)
 		return nil, err
 	}
+
+	klog.V(4).InfoS("token exchange HTTP request completed",
+		"status_code", resp.StatusCode,
+		"duration_ms", exchangeDuration.Milliseconds())
+
 	gcpIamMetricRecorder(csrmetrics.OutboundRPCStatus(strconv.Itoa(resp.StatusCode)))
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("could not get idbindtoken token, status: %v", resp.StatusCode)
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		klog.ErrorS(nil, "token exchange request failed with non-200 status code",
+			"status_code", resp.StatusCode,
+			"response_body", string(respBody),
+			"endpoint", identityBindingTokenEndPoint)
+		return nil, fmt.Errorf("could not get idbindtoken token, status: %v, body: %s", resp.StatusCode, string(respBody))
 	}
 
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		klog.ErrorS(err, "failed to read token exchange response body")
 		return nil, err
 	}
 
 	idBindToken := &oauth2.Token{}
 	if err := json.Unmarshal(respBody, idBindToken); err != nil {
+		klog.ErrorS(err, "failed to unmarshal token exchange response",
+			"response_body_length", len(respBody))
 		return nil, err
 	}
+
+	klog.V(4).InfoS("token exchange successful",
+		"token_type", idBindToken.TokenType,
+		"expiry", idBindToken.Expiry,
+		"has_refresh_token", idBindToken.RefreshToken != "")
+
 	return idBindToken, nil
 }
 
 func (c *Client) genericWIFAuth(ctx context.Context, cfg *config.MountConfig) (string, string, string, error) {
 	klog.InfoS("starting generic WIF authentication",
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
+		"service_account", cfg.PodInfo.ServiceAccount)
+
+	// Log all available WIF config for easier debugging
+	klog.InfoS("generic WIF configuration parameters",
+		"available_params", cfg.WIFConfig,
 		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 
 	// Check for required configuration
 	audience, ok := cfg.WIFConfig["audience"]
 	if !ok {
 		klog.ErrorS(nil, "missing required 'wif.audience' configuration for generic WIF",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
+			"available_params", cfg.WIFConfig)
 		return "", "", "", fmt.Errorf("missing required 'wif.audience' configuration for generic WIF")
 	}
 
@@ -393,6 +568,11 @@ func (c *Client) genericWIFAuth(ctx context.Context, cfg *config.MountConfig) (s
 				"idProvider", idProvider,
 				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 			return idPool, idProvider, "", nil
+		} else {
+			klog.ErrorS(nil, "audience has identitynamespace prefix but is malformed",
+				"audience", audience,
+				"expected_format", "identitynamespace:<idPool>:<idProvider>",
+				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		}
 	}
 
@@ -402,10 +582,26 @@ func (c *Client) genericWIFAuth(ctx context.Context, cfg *config.MountConfig) (s
 		"audience", audience,
 		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 
+	// Check if the audience matches expected WIF pool format
+	if strings.Contains(audience, "workloadIdentityPools") {
+		klog.InfoS("audience appears to be a GCP Workload Identity Pool",
+			"audience", audience,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	} else {
+		klog.V(4).InfoS("audience format doesn't match standard GCP WIF pool format, proceed with caution",
+			"audience", audience,
+			"expected_to_contain", "workloadIdentityPools",
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	}
+
 	// For debugging/telemetry, log credential source if provided
 	if credSource, ok := cfg.WIFConfig["credential_source"]; ok {
 		klog.InfoS("credential source specified for generic WIF",
 			"credential_source", credSource,
+			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	} else {
+		klog.V(4).InfoS("no credential source specified, will use default k8s ServiceAccount token",
+			"service_account", cfg.PodInfo.ServiceAccount,
 			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 	}
 
@@ -428,6 +624,7 @@ func (c *Client) genericWIFAuth(ctx context.Context, cfg *config.MountConfig) (s
 		if envVarVal != "" {
 			klog.InfoS("found environment variable for generic WIF",
 				"env_var", envVarName,
+				"env_var_exists", true,
 				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		} else {
 			klog.ErrorS(nil, "environment variable specified but not found",
@@ -435,6 +632,13 @@ func (c *Client) genericWIFAuth(ctx context.Context, cfg *config.MountConfig) (s
 				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 		}
 	}
+
+	// Log the result of audience resolution
+	klog.InfoS("generic WIF audience resolution complete",
+		"resolved_audience", audience,
+		"idPool", idPool,
+		"idProvider", idProvider,
+		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 
 	return "", "", audience, nil
 }
