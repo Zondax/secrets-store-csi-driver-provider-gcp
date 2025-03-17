@@ -10,7 +10,7 @@ Generic Workload Identity Federation (WIF) allows non-GKE and non-Fleet-managed 
 
 ### SecretProviderClass Configuration
 
-To use Generic WIF, specify `auth: "generic-wif"` in your SecretProviderClass configuration along with additional WIF parameters:
+The external WIF is just available using pod-adc auth. To enable it add `wif.mode: external`  and `wif.audience: my-audience` in your SecretProviderClass configuration:
 
 ```yaml
 apiVersion: secrets-store.csi.x-k8s.io/v1
@@ -20,15 +20,11 @@ metadata:
 spec:
   provider: gcp
   parameters:
-    auth: "generic-wif"
+    auth: "pod-adc"
     # Required - The audience string for your WIF configuration
-    wif.audience: "//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID"
-    # Optional - Override the default token URL
-    wif.token_url: "https://sts.googleapis.com/v1/token"
-    # Optional - Specify credential source information for debugging
-    wif.credential_source: "file:/var/run/secrets/tokens/gcp-ksa/token"
-    # Optional - Specify an environment variable name that contains configuration
-    wif.env_var: "GOOGLE_APPLICATION_CREDENTIALS"
+    wif.audience: my-audience
+    # Required - Enables external WIF configuration
+    wif.mode: external
     # Secret configuration as usual
     secrets: |
       - resourceName: "projects/PROJECT_ID/secrets/SECRET_NAME/versions/latest"
@@ -37,15 +33,9 @@ spec:
 
 ### Required Parameters
 
-- `wif.audience`: The audience string for your WIF configuration. This could be:
-  - A standard GCP Workload Identity Pool audience like: `//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID`
-  - A namespaced identity format: `identitynamespace:POOL:PROVIDER`
+- `wif.audience`: The audience string for your external WIF jwt auth. 
+- `wif.mode`: The mode for the WIF auth, `external`
 
-### Optional Parameters
-
-- `wif.token_url`: The token URL to use for token exchange. Defaults to `https://sts.googleapis.com/v1/token`.
-- `wif.credential_source`: Information about the credential source, helpful for debugging.
-- `wif.env_var`: An environment variable name that contains WIF configuration.
 
 ## Diagnostic Logs
 

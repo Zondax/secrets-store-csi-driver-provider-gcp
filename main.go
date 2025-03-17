@@ -55,6 +55,7 @@ import (
 var (
 	kubeconfig            = flag.String("kubeconfig", "", "absolute path to kubeconfig file")
 	logFormatJSON         = flag.Bool("log-format-json", true, "set log formatter to json")
+	logLevel              = flag.Int("log-level", 0, "set log level")
 	metricsAddr           = flag.String("metrics_addr", ":8095", "configure http listener for reporting metrics")
 	enableProfile         = flag.Bool("enable-pprof", false, "enable pprof profiling")
 	debugAddr             = flag.String("debug_addr", "localhost:6060", "port for pprof profiling")
@@ -71,9 +72,12 @@ func main() {
 
 	flag.Parse()
 
+	flag.Set("v", fmt.Sprintf("%d", *logLevel))
+	flag.Set("vmodule", "*=5")
+
 	if *logFormatJSON {
 		jsonFactory := jlogs.Factory{}
-		logger, _ := jsonFactory.Create(logsapi.LoggingConfiguration{Format: "json"}, logsapi.LoggingOptions{ErrorStream: os.Stderr, InfoStream: os.Stdout})
+		logger, _ := jsonFactory.Create(logsapi.LoggingConfiguration{Format: "json", Verbosity: logsapi.VerbosityLevel(*logLevel)}, logsapi.LoggingOptions{ErrorStream: os.Stderr, InfoStream: os.Stdout})
 		klog.SetLogger(logger)
 	}
 

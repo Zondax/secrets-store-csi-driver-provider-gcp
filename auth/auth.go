@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -39,6 +40,7 @@ import (
 	"github.com/googleapis/gax-go/v2"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/google/externalaccount"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/oauth"
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -47,7 +49,13 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const cloudScope = "https://www.googleapis.com/auth/cloud-platform"
+const (
+	cloudScope                  = "https://www.googleapis.com/auth/cloud-platform"
+	adcEnvVar                   = "GOOGLE_APPLICATION_CREDENTIALS"
+	adcWellKnown                = "application_default_credentials.json"
+	adcImpersonationAnnotation  = "iam.gke.io/gcp-service-account"
+	adcImpersonationURL         = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts"
+)
 
 type Client struct {
 	KubeClient     *kubernetes.Clientset
@@ -63,9 +71,36 @@ const (
 
 // credentialsFile is the unmarshalled representation of a credentials file.
 type credentialsFile struct {
-	Type string `json:"type"`
+	Type 			string `json:"type"`
+	UniverseDomain 	string `json:"universe_domain"`
+
 	// External Account fields
-	Audience string `json:"audience"`
+	Audience                       string                           `json:"audience"`
+	SubjectTokenType               string                           `json:"subject_token_type"`
+	TokenURLExternal               string                           `json:"token_url"`
+	TokenInfoURL                   string                           `json:"token_info_url"`
+	ServiceAccountImpersonationURL string                           `json:"service_account_impersonation_url"`
+	Delegates                      []string                         `json:"delegates"`
+	CredentialSource               externalaccount.CredentialSource `json:"credential_source"`
+	QuotaProjectID                 string                           `json:"quota_project_id"`
+	WorkforcePoolUserProject       string                           `json:"workforce_pool_user_project"`
+
+	// External Account Authorized User fields
+	RevokeURL string `json:"revoke_url"`
+
+	// Service account impersonation
+	SourceCredentials *credentialsFile `json:"source_credentials"`
+}
+
+type K8STokenSupplier struct {
+	token     string
+}
+
+func (c *K8STokenSupplier) SubjectToken(ctx context.Context, options externalaccount.SupplierOptions) (string, error) {
+	if c.token == "" {
+		return "", fmt.Errorf("K8STokenSupplier token is empty")
+	}
+	return c.token, nil
 }
 
 // TokenSource returns the correct oauth2.TokenSource depending on the auth
@@ -89,6 +124,10 @@ func (c *Client) TokenSource(ctx context.Context, cfg *config.MountConfig) (oaut
 	}
 
 	if cfg.AuthPodADC {
+		if cfg.AuthPodADCExternal {
+			return c.externalTokenSource(ctx, cfg.PodInfo, cfg.WIFConfig["audience"])
+		}
+
 		token, err := c.Token(ctx, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("unable to obtain workload identity auth: %v", err)
@@ -96,16 +135,54 @@ func (c *Client) TokenSource(ctx context.Context, cfg *config.MountConfig) (oaut
 		return oauth2.StaticTokenSource(token), nil
 	}
 
-	if cfg.AuthGenericWIF {
-		klog.InfoS("using generic WIF for authentication")
-		token, err := c.Token(ctx, cfg)
-		if err != nil {
-			return nil, fmt.Errorf("unable to obtain generic workload identity federation auth: %v", err)
-		}
-		return oauth2.StaticTokenSource(token), nil
+	return nil, errors.New("mount configuration has no auth method configured")
+}
+
+func (c *Client) externalTokenSource(ctx context.Context, podInfo *config.PodInfo, audience string) (oauth2.TokenSource, error) {
+	saToken, err := c.getPodSAToken(ctx, podInfo, audience)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, errors.New("mount configuration has no auth method configured")
+	saImpersonation, err := c.getPodSAImpersonation(ctx, podInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	// Getting credFile from ENV
+	credFile, err := credentialFileFromENV(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generating external account config with SA token
+	config := externalaccount.Config{
+		Audience: credFile.Audience,
+		SubjectTokenType: credFile.SubjectTokenType,
+		TokenURL: credFile.TokenURLExternal,
+		TokenInfoURL: credFile.TokenInfoURL,
+		//ServiceAccountImpersonationURL: credFile.ServiceAccountImpersonationURL,
+		//ServiceAccountImpersonationLifetimeSeconds: credFile.ServiceAccountImpersonationLifetimeSeconds,
+		//ClientSecret: credFile.ClientSecret,
+		//ClientID: credFile.ClientID,
+		//CredentialSource *CredentialSource
+		QuotaProjectID: credFile.QuotaProjectID,
+		Scopes: []string{cloudScope},
+		WorkforcePoolUserProject: credFile.WorkforcePoolUserProject,
+		// Setting K8STokenSupplier with SA token
+		SubjectTokenSupplier: &K8STokenSupplier{
+			token: saToken,
+		},
+		//AwsSecurityCredentialsSupplier: credFile.TokenURLExternal,
+		UniverseDomain: credFile.UniverseDomain,
+	}
+
+	if saImpersonation != "" {
+		// Generating ServiceAccountImpersonationURL when SA has impersonation annotation
+		config.ServiceAccountImpersonationURL = fmt.Sprintf("%s/%s:generateAccessToken", adcImpersonationURL, saImpersonation)
+	}
+
+	return externalaccount.NewTokenSource(ctx, config)
 }
 
 // Token fetches a workload identity auth token for the pod for the MountConfig.
@@ -134,51 +211,16 @@ func (c *Client) Token(ctx context.Context, cfg *config.MountConfig) (*oauth2.To
 	var idPool, idProvider string
 	var err error
 
-	klog.InfoS("starting token acquisition process",
-		"auth_mode", getAuthMode(cfg),
+	klog.InfoS("using standard workload identity mode",
 		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
 
-	if cfg.AuthGenericWIF {
-		klog.InfoS("using generic WIF authentication mode",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-		idPool, idProvider, audience, err = c.genericWIFAuth(ctx, cfg)
+	idPool, idProvider, err = c.gkeWorkloadIdentity(ctx, cfg)
+	if err != nil {
+		idPool, idProvider, audience, err = c.fleetWorkloadIdentity(ctx, cfg)
 		if err != nil {
-			klog.ErrorS(err, "generic WIF authentication failed",
+			klog.ErrorS(err, "both GKE and fleet workload identity failed",
 				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-			return nil, fmt.Errorf("generic WIF authentication failed: %w", err)
-		}
-		klog.InfoS("generic WIF authentication successful",
-			"idPool", idPool,
-			"idProvider", idProvider,
-			"audience", audience,
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-	} else {
-		klog.InfoS("using standard workload identity mode",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-		idPool, idProvider, err = c.gkeWorkloadIdentity(ctx, cfg)
-		if err != nil {
-			klog.V(4).InfoS("GKE workload identity failed, trying fleet workload identity",
-				"error", err,
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-			idPool, idProvider, audience, err = c.fleetWorkloadIdentity(ctx, cfg)
-			if err != nil {
-				klog.ErrorS(err, "both GKE and fleet workload identity failed",
-					"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-				return nil, err
-			}
-			klog.InfoS("fleet workload identity configuration detected",
-				"idPool", idPool,
-				"idProvider", idProvider,
-				"audience", audience,
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-		} else {
-			klog.InfoS("GKE workload identity configuration detected",
-				"idPool", idPool,
-				"idProvider", idProvider,
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+			return nil, err
 		}
 	}
 
@@ -196,75 +238,14 @@ func (c *Client) Token(ctx context.Context, cfg *config.MountConfig) (*oauth2.To
 	// Get iam.gke.io/gcp-service-account annotation to see if the
 	// identitybindingtoken token should be traded for a GCP SA token.
 	// See https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity#creating_a_relationship_between_ksas_and_gsas
-	klog.InfoS("retrieving ServiceAccount information from Kubernetes",
-		"namespace", cfg.PodInfo.Namespace,
-		"service_account", cfg.PodInfo.ServiceAccount,
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-	saResp, err := c.KubeClient.
-		CoreV1().
-		ServiceAccounts(cfg.PodInfo.Namespace).
-		Get(ctx, cfg.PodInfo.ServiceAccount, v1.GetOptions{})
+	gcpSA, err := c.getPodSAImpersonation(ctx, cfg.PodInfo)
 	if err != nil {
-		klog.ErrorS(err, "failed to retrieve ServiceAccount information",
-			"namespace", cfg.PodInfo.Namespace,
-			"service_account", cfg.PodInfo.ServiceAccount,
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-		return nil, fmt.Errorf("unable to fetch SA info: %w", err)
+		return nil, err
 	}
 
-	gcpSA := saResp.Annotations["iam.gke.io/gcp-service-account"]
-	klog.InfoS("service account annotation check complete",
-		"k8s_service_account", cfg.PodInfo.ServiceAccount,
-		"gcp_service_account_annotation", gcpSA,
-		"has_gcp_sa_annotation", gcpSA != "",
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-	klog.V(5).InfoS("matched service account", "service_account", gcpSA)
-
-	// Obtain a serviceaccount token for the pod.
-	klog.InfoS("obtaining Kubernetes ServiceAccount token",
-		"service_account", cfg.PodInfo.ServiceAccount,
-		"namespace", cfg.PodInfo.Namespace,
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
-		"has_driver_token", cfg.PodInfo.ServiceAccountTokens != "")
-
-	var saTokenVal string
-	if cfg.PodInfo.ServiceAccountTokens != "" {
-		klog.V(4).InfoS("extracting ServiceAccount token from driver-provided tokens",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-		saToken, err := c.extractSAToken(cfg, idPool, audience) // calling function to extract token received from driver.
-		if err != nil {
-			klog.ErrorS(err, "failed to extract ServiceAccount token from driver tokens",
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-			return nil, fmt.Errorf("unable to fetch SA token from driver: %w", err)
-		}
-
-		klog.InfoS("successfully extracted ServiceAccount token from driver",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
-			"token_expiration", saToken.ExpirationTimestamp)
-
-		saTokenVal = saToken.Token
-	} else {
-		klog.V(4).InfoS("generating new ServiceAccount token",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
-			"service_account", cfg.PodInfo.ServiceAccount,
-			"namespace", cfg.PodInfo.Namespace)
-
-		saToken, err := c.generatePodSAToken(ctx, cfg, idPool, audience) // if no token received, provider generates its own token.
-		if err != nil {
-			klog.ErrorS(err, "failed to generate ServiceAccount token",
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
-				"service_account", cfg.PodInfo.ServiceAccount)
-			return nil, fmt.Errorf("unable to fetch pod token: %w", err)
-		}
-
-		klog.InfoS("successfully generated new ServiceAccount token",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
-			"token_expiration", saToken.ExpirationTimestamp)
-
-		saTokenVal = saToken.Token
+	saTokenVal, err := c.getSAToken(ctx, cfg.PodInfo, idPool, audience)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get SA token: %w", err)
 	}
 
 	// Trade the kubernetes token for an identitybindingtoken token.
@@ -319,58 +300,93 @@ func (c *Client) Token(ctx context.Context, cfg *config.MountConfig) (*oauth2.To
 	return &oauth2.Token{AccessToken: gcpSAResp.GetAccessToken()}, nil
 }
 
-// Helper function to determine the auth mode string
-func getAuthMode(cfg *config.MountConfig) string {
-	if cfg.AuthGenericWIF {
-		return "generic-wif"
-	} else if cfg.AuthPodADC {
-		return "pod-adc"
-	} else if cfg.AuthProviderADC {
-		return "provider-adc"
-	} else if cfg.AuthNodePublishSecret {
-		return "node-publish-secret"
+func (c *Client) getPodSAImpersonation(ctx context.Context, podInfo *config.PodInfo) (string, error) {
+	saResp, err := c.KubeClient.
+		CoreV1().
+		ServiceAccounts(podInfo.Namespace).
+		Get(ctx, podInfo.ServiceAccount, v1.GetOptions{})
+	if err != nil {
+		klog.ErrorS(err, "failed to retrieve ServiceAccount information",
+			"namespace", podInfo.Namespace,
+			"service_account", podInfo.ServiceAccount,
+			"pod", klog.ObjectRef{Namespace: podInfo.Namespace, Name: podInfo.Name})
+		return "", fmt.Errorf("unable to fetch SA info: %w", err)
 	}
-	return "unknown"
+
+	return saResp.Annotations[adcImpersonationAnnotation], nil
 }
 
-func (c *Client) extractSAToken(cfg *config.MountConfig, idPool, audience string) (*authenticationv1.TokenRequestStatus, error) {
+func (c *Client) getSAToken(ctx context.Context, podInfo *config.PodInfo, idPool, audience string) (string, error) {
+	aud := idPool
+	if aud == "" {
+		aud = audience
+	}
+	return c.getPodSAToken(ctx, podInfo, aud)
+}
+
+func (c *Client) getPodSAToken(ctx context.Context, podinfo *config.PodInfo, audience string) (string, error) {
+	if podinfo.ServiceAccountTokens != "" {
+		saToken, err := c.extractPodSAToken(podinfo, audience) // calling function to extract token received from driver.
+		if err != nil {
+			klog.ErrorS(err, "failed to extract ServiceAccount token from driver tokens",
+				"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name})
+			return "", fmt.Errorf("unable to fetch SA token from driver: %w", err)
+		}
+
+		return saToken.Token, nil
+	}
+
+	saToken, err := c.generatePodSAToken(ctx, podinfo, audience) // if no token received, provider generates its own token.
+	if err != nil {
+		klog.ErrorS(err, "failed to generate ServiceAccount token",
+			"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name},
+			"service_account", podinfo.ServiceAccount)
+		return "", fmt.Errorf("unable to generate SA token: %w", err)
+	}
+
+	return saToken.Token, nil
+}
+
+func (c *Client) extractPodSAToken(podinfo *config.PodInfo, audience string) (*authenticationv1.TokenRequestStatus, error) {
+	klog.V(5).InfoS("extracting SA token from driver-provided tokens",
+			"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name})
+
 	audienceTokens := map[string]authenticationv1.TokenRequestStatus{}
-	if err := json.Unmarshal([]byte(cfg.PodInfo.ServiceAccountTokens), &audienceTokens); err != nil {
+	if err := json.Unmarshal([]byte(podinfo.ServiceAccountTokens), &audienceTokens); err != nil {
 		return nil, err
 	}
-	for k, v := range audienceTokens {
-		if k == idPool || k == audience { // Only returns the token if the audience is the workload identity. Other tokens cannot be used.
-			return &v, nil
-		}
+
+	if v, ok := audienceTokens[audience]; ok {
+		return &v, nil
 	}
-	return nil, fmt.Errorf("no token has audience value of idPool")
+
+	return nil, fmt.Errorf("no SA token for pod %s/%s has audience value %s", podinfo.Namespace, podinfo.Name, audience)
 }
 
-func (c *Client) generatePodSAToken(ctx context.Context, cfg *config.MountConfig, idPool, audience string) (*authenticationv1.TokenRequestStatus, error) {
+func (c *Client) generatePodSAToken(ctx context.Context, podinfo *config.PodInfo, audience string) (*authenticationv1.TokenRequestStatus, error) {
+	klog.V(5).InfoS("generating SA token from driver-provided tokens",
+			"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name})
+
 	ttl := int64((15 * time.Minute).Seconds())
-	_audience := idPool
-	if _audience == "" {
-		_audience = audience
-	}
 	resp, err := c.KubeClient.CoreV1().
-		ServiceAccounts(cfg.PodInfo.Namespace).
-		CreateToken(ctx, cfg.PodInfo.ServiceAccount,
+		ServiceAccounts(podinfo.Namespace).
+		CreateToken(ctx, podinfo.ServiceAccount,
 			&authenticationv1.TokenRequest{
 				Spec: authenticationv1.TokenRequestSpec{
 					ExpirationSeconds: &ttl,
-					Audiences:         []string{_audience},
+					Audiences:         []string{audience},
 					BoundObjectRef: &authenticationv1.BoundObjectReference{
 						Kind:       "Pod", // Pod and secret are the only valid types
 						APIVersion: "v1",
-						Name:       cfg.PodInfo.Name,
-						UID:        cfg.PodInfo.UID,
+						Name:       podinfo.Name,
+						UID:        podinfo.UID,
 					},
 				},
 			},
 			v1.CreateOptions{},
 		)
 	if err != nil {
-		return nil, fmt.Errorf("unable to fetch pod token: %w", err)
+		return nil, fmt.Errorf("unable to generate SA token for pod %s/%s: %w", podinfo.Namespace, podinfo.Name, err)
 	}
 	return &resp.Status, nil
 }
@@ -402,13 +418,12 @@ func (c *Client) gkeWorkloadIdentity(ctx context.Context, cfg *config.MountConfi
 }
 
 func (c *Client) fleetWorkloadIdentity(ctx context.Context, cfg *config.MountConfig) (string, string, string, error) {
-	const envVar = "GOOGLE_APPLICATION_CREDENTIALS"
 	var jsonData []byte
 	var err error
-	if filename := os.Getenv(envVar); filename != "" {
+	if filename := os.Getenv(adcEnvVar); filename != "" {
 		jsonData, err = os.ReadFile(filepath.Clean(filename))
 		if err != nil {
-			return "", "", "", fmt.Errorf("google: error getting credentials using %v environment variable: %v", envVar, err)
+			return "", "", "", fmt.Errorf("google: error getting credentials using %v environment variable: %v", adcEnvVar, err)
 		}
 	}
 
@@ -452,7 +467,7 @@ func tradeIDBindToken(ctx context.Context, client *http.Client, k8sToken, audien
 		"requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
 		"subject_token":        k8sToken,
 		"audience":             audience,
-		"scope":                "https://www.googleapis.com/auth/cloud-platform",
+		"scope":                cloudScope,
 	})
 	if err != nil {
 		klog.ErrorS(err, "failed to marshal token exchange request body")
@@ -529,116 +544,38 @@ func tradeIDBindToken(ctx context.Context, client *http.Client, k8sToken, audien
 	return idBindToken, nil
 }
 
-func (c *Client) genericWIFAuth(ctx context.Context, cfg *config.MountConfig) (string, string, string, error) {
-	klog.InfoS("starting generic WIF authentication",
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
-		"service_account", cfg.PodInfo.ServiceAccount)
-
-	// Log all available WIF config for easier debugging
-	klog.InfoS("generic WIF configuration parameters",
-		"available_params", cfg.WIFConfig,
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-	// Check for required configuration
-	audience, ok := cfg.WIFConfig["audience"]
-	if !ok {
-		klog.ErrorS(nil, "missing required 'wif.audience' configuration for generic WIF",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name},
-			"available_params", cfg.WIFConfig)
-		return "", "", "", fmt.Errorf("missing required 'wif.audience' configuration for generic WIF")
+func wellKnownFile() string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		u, err := user.Current()
+		if err != nil {
+			return ""
+		}
+		home = u.HomeDir
 	}
+	return fmt.Sprintf("%s/.config/gcloud/%s", home, adcWellKnown)
+}
 
-	klog.InfoS("using WIF audience from configuration",
-		"audience", audience,
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-	// Handle different audience formats
-	// Format 1: Direct audience string for Workload Identity Federation pools
-	// Format 2: identitynamespace:<idPool>:<idProvider>
-	var idPool, idProvider string
-
-	if strings.HasPrefix(audience, "identitynamespace:") {
-		// Try to parse the audience string in the standard format
-		split := strings.SplitN(audience, ":", 3)
-		if len(split) >= 3 {
-			idPool = split[1]
-			idProvider = split[2]
-			klog.InfoS("parsed identity namespace components from audience",
-				"idPool", idPool,
-				"idProvider", idProvider,
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-			return idPool, idProvider, "", nil
-		} else {
-			klog.ErrorS(nil, "audience has identitynamespace prefix but is malformed",
-				"audience", audience,
-				"expected_format", "identitynamespace:<idPool>:<idProvider>",
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+func credentialFileFromENV(ctx context.Context) (*credentialsFile, error)  {
+	filename := os.Getenv(adcEnvVar)
+	if filename == "" {
+		// Second, try a well-known file.
+		filename = wellKnownFile()
+		if filename == "" {
+			return nil, fmt.Errorf("google: error getting adc well known files")
 		}
 	}
-
-	// If not in standard format, use it directly as audience
-	// Expect format like "//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID"
-	klog.InfoS("using audience as-is for WIF",
-		"audience", audience,
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-	// Check if the audience matches expected WIF pool format
-	if strings.Contains(audience, "workloadIdentityPools") {
-		klog.InfoS("audience appears to be a GCP Workload Identity Pool",
-			"audience", audience,
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-	} else {
-		klog.V(4).InfoS("audience format doesn't match standard GCP WIF pool format, proceed with caution",
-			"audience", audience,
-			"expected_to_contain", "workloadIdentityPools",
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+	jsonData, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("google: error reading credentials from well known files: %v", err)
 	}
+	return credentialFileFromJSON(ctx, jsonData)
+}
 
-	// For debugging/telemetry, log credential source if provided
-	if credSource, ok := cfg.WIFConfig["credential_source"]; ok {
-		klog.InfoS("credential source specified for generic WIF",
-			"credential_source", credSource,
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-	} else {
-		klog.V(4).InfoS("no credential source specified, will use default k8s ServiceAccount token",
-			"service_account", cfg.PodInfo.ServiceAccount,
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
+func credentialFileFromJSON(ctx context.Context, jsonData []byte) (*credentialsFile, error)  {
+	credFile := &credentialsFile{}
+	if err := json.Unmarshal(jsonData, &credFile); err != nil {
+		return nil, fmt.Errorf("google: error parsing credentials from well known files: %v", err)
 	}
-
-	// Get token URL from config or use default
-	tokenURL := cfg.WIFConfig["token_url"]
-	if tokenURL == "" {
-		tokenURL = "https://sts.googleapis.com/v1/token"
-		klog.InfoS("using default token URL for generic WIF",
-			"token_url", tokenURL,
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-	} else {
-		klog.InfoS("using configured token URL for generic WIF",
-			"token_url", tokenURL,
-			"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-	}
-
-	// Override environment variable if provided
-	if envVarName, ok := cfg.WIFConfig["env_var"]; ok {
-		envVarVal := os.Getenv(envVarName)
-		if envVarVal != "" {
-			klog.InfoS("found environment variable for generic WIF",
-				"env_var", envVarName,
-				"env_var_exists", true,
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-		} else {
-			klog.ErrorS(nil, "environment variable specified but not found",
-				"env_var", envVarName,
-				"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-		}
-	}
-
-	// Log the result of audience resolution
-	klog.InfoS("generic WIF audience resolution complete",
-		"resolved_audience", audience,
-		"idPool", idPool,
-		"idProvider", idProvider,
-		"pod", klog.ObjectRef{Namespace: cfg.PodInfo.Namespace, Name: cfg.PodInfo.Name})
-
-	return "", "", audience, nil
+	return credFile, nil
 }

@@ -30,11 +30,14 @@ import (
 )
 
 const (
+	attributeAuth                 = "auth"
 	attributePodName              = "csi.storage.k8s.io/pod.name"
 	attributePodNamespace         = "csi.storage.k8s.io/pod.namespace"
 	attributePodUID               = "csi.storage.k8s.io/pod.uid"
 	attributeServiceAccountName   = "csi.storage.k8s.io/serviceAccount.name"
 	attributeServiceAccountTokens = "csi.storage.k8s.io/serviceAccount.tokens" //#nosec G101 -- This is a false positive. Token value is not being revealed. This is just the key name.
+	attributeWifAudience          = "audience"
+	attributeWifMode              = "mode"
 )
 
 // Secret holds the parameters of the SecretProviderClass CRD. Links the GCP
@@ -73,6 +76,7 @@ type MountConfig struct {
 	// AuthPodADC identifies whether Workload Identity should be used for
 	// authentication. This is the of the pod for volume mount (default)
 	AuthPodADC bool
+	AuthPodADCExternal bool
 	// AuthProviderADC identifies whether the Application Default Credentials of the
 	// GCP Provider DaemonSet should be used for authentication.
 	// https://cloud.google.com/docs/authentication/production#automatically
@@ -85,12 +89,7 @@ type MountConfig struct {
 	// Google credential (parseable by google.CredentialsFromJSON).
 	AuthNodePublishSecret bool
 	AuthKubeSecret        []byte
-	// AuthGenericWIF identifies whether the Generic Workload Identity Federation
-	// should be used for authentication. This allows support for non-GKE and non-Fleet
-	// clusters using Workload Identity Federation.
-	AuthGenericWIF bool
 	// WIFConfig contains additional configuration options for Workload Identity Federation
-	// when using the generic-wif auth method.
 	WIFConfig map[string]string
 }
 
@@ -116,6 +115,7 @@ func Parse(in *MountParams) (*MountConfig, error) {
 	out.Permissions = in.Permissions
 	out.TargetPath = in.TargetPath
 	out.Secrets = make([]*Secret, 0)
+	out.WIFConfig = make(map[string]string)
 
 	var attrib, secret map[string]string
 
@@ -154,7 +154,7 @@ func Parse(in *MountParams) (*MountConfig, error) {
 		klog.Infoln("Authentication using nodepublishsecret ref is disabled")
 	}
 
-	switch attrib["auth"] {
+	switch attrib[attributeAuth] {
 	case "provider-adc":
 		if out.AuthNodePublishSecret {
 			klog.InfoS("attempting to set both nodePublishSecretRef and provider-adc auth. For details consult https://github.com/GoogleCloudPlatform/secrets-store-csi-driver-provider-gcp/blob/main/docs/authentication.md", "pod", podInfo)
@@ -167,39 +167,36 @@ func Parse(in *MountParams) (*MountConfig, error) {
 			return nil, fmt.Errorf("attempting to set both nodePublishSecretRef and pod-adc auth")
 		}
 		out.AuthPodADC = true
-	case "generic-wif":
-		if out.AuthNodePublishSecret {
-			klog.InfoS("attempting to set both nodePublishSecretRef and generic-wif auth", "pod", podInfo)
-			return nil, fmt.Errorf("attempting to set both nodePublishSecretRef and generic-wif auth")
-		}
-		out.AuthGenericWIF = true
-		// Extract any WIF specific config options
-		out.WIFConfig = make(map[string]string)
-		for key, val := range attrib {
-			if strings.HasPrefix(key, "wif.") {
-				configKey := strings.TrimPrefix(key, "wif.")
-				out.WIFConfig[configKey] = val
-				klog.V(5).InfoS("parsed WIF config option", "key", configKey, "value", val, "pod", podInfo)
-			}
-		}
-		klog.InfoS("using generic WIF authentication", "wif_config_keys", mapKeys(out.WIFConfig), "pod", podInfo)
 	case "":
 		// default to pod auth unless nodePublishSecret is set
 		out.AuthPodADC = !out.AuthNodePublishSecret
 	default:
 		klog.InfoS("unknown auth configuration", "pod", podInfo)
-		return nil, fmt.Errorf("unknown auth configuration: %q", attrib["auth"])
+		return nil, fmt.Errorf("unknown auth configuration: %q", attrib[attributeAuth])
 	}
 
 	if out.AuthNodePublishSecret {
-		klog.V(3).InfoS("parsed auth", "auth", "nodePublishSecretRef", "pod", podInfo)
+		klog.V(3).InfoS("parsed auth", attributeAuth, "nodePublishSecretRef", "pod", podInfo)
 	}
+
+	for key, val := range attrib {
+		if strings.HasPrefix(key, "wif.") {
+			configKey := strings.TrimPrefix(key, "wif.")
+			out.WIFConfig[configKey] = val
+			klog.V(5).InfoS("parsed WIF config option", "key", configKey, "value", val, "pod", podInfo)
+		}
+	}
+
 	if out.AuthPodADC {
-		klog.V(3).InfoS("parsed auth", "auth", "pod-adc", "pod", podInfo)
+		if v, ok := out.WIFConfig[attributeWifMode]; ok && v == "external" {
+			if v, ok := out.WIFConfig[attributeWifAudience]; !ok || len(v) == 0 {
+				return nil, fmt.Errorf("wif.%s should be defined for wif external mode", attributeWifAudience)
+			}
+			out.AuthPodADCExternal = true
+		}
 	}
-	if out.AuthProviderADC {
-		klog.V(3).InfoS("parsed auth", "auth", "provider-adc", "pod", podInfo)
-	}
+
+	klog.V(3).InfoS("parsed auth", attributeAuth, attrib[attributeAuth], "pod", podInfo)
 
 	if os.Getenv("DEBUG") == "true" {
 		klog.V(5).InfoS(fmt.Sprintf("attributes: %v", attrib), "pod", podInfo)
@@ -219,13 +216,4 @@ func Parse(in *MountParams) (*MountConfig, error) {
 	}
 
 	return out, nil
-}
-
-// mapKeys returns the keys of a map as a string slice.
-func mapKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }
