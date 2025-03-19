@@ -38,6 +38,7 @@ const (
 	attributeServiceAccountTokens = "csi.storage.k8s.io/serviceAccount.tokens" //#nosec G101 -- This is a false positive. Token value is not being revealed. This is just the key name.
 	attributeWifAudience          = "audience"
 	attributeWifMode              = "mode"
+	attributeWifProvAudience      = "provider.audience"
 )
 
 // Secret holds the parameters of the SecretProviderClass CRD. Links the GCP
@@ -75,7 +76,7 @@ type MountConfig struct {
 	Permissions os.FileMode
 	// AuthPodADC identifies whether Workload Identity should be used for
 	// authentication. This is the of the pod for volume mount (default)
-	AuthPodADC bool
+	AuthPodADC         bool
 	AuthPodADCExternal bool
 	// AuthProviderADC identifies whether the Application Default Credentials of the
 	// GCP Provider DaemonSet should be used for authentication.

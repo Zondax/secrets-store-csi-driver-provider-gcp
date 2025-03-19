@@ -6,6 +6,24 @@ Expand the name of the chart.
 {{- end }}
 
 {{/*
+Create a default fully qualified app name.
+We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+If release name contains chart name it will be used as a full name.
+*/}}
+{{- define "secrets-store-csi-driver-provider-gcp.fullname" -}}
+{{- if .Values.fullnameOverride }}
+  {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+  {{- $name := default .Chart.Name .Values.name }}
+  {{- if contains $name .Release.Name }}
+    {{- .Release.Name | trunc 63 | trimSuffix "-" }}
+  {{- else }}
+    {{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+  {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Create chart name and version as used by the chart label.
 */}}
 {{- define "secrets-store-csi-driver-provider-gcp.chart" -}}
@@ -29,32 +47,36 @@ Selector labels
 */}}
 {{- define "secrets-store-csi-driver-provider-gcp.selectorLabels" -}}
 app: {{ default "default" .Values.app }}
+app.kubernetes.io/name: {{ include "secrets-store-csi-driver-provider-gcp.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+
 
 {{/*
 Create the name of the service account to use
 */}}
 {{- define "secrets-store-csi-driver-provider-gcp.serviceAccountName" -}}
-{{- default "default" .Values.serviceAccount.name }}
+{{- or .Values.serviceAccount.name (include "secrets-store-csi-driver-provider-gcp.fullname" .) }}
 {{- end }}
 
 {{/*
 Create the name of the daemon set to use
 */}}
 {{- define "secrets-store-csi-driver-provider-gcp.daemonSetName" -}}
-{{- default "default" .Values.app }}
+{{- include "secrets-store-csi-driver-provider-gcp.fullname" . }}
 {{- end }}
 
 {{/*
 Create the name of the cluster role to use
 */}}
 {{- define "secrets-store-csi-driver-provider-gcp.clusterRoleName" -}}
-{{- .Chart.Name }}-role
+{{- include "secrets-store-csi-driver-provider-gcp.fullname" . }}
 {{- end }}
 
 {{/*
 Create the name of the cluster role binding to use
 */}}
 {{- define "secrets-store-csi-driver-provider-gcp.clusterRoleBindingName" -}}
-{{- .Chart.Name }}-rolebinding
+{{- include "secrets-store-csi-driver-provider-gcp.fullname" . }}
 {{- end }}

@@ -13,21 +13,8 @@ a Google authentication token using the Kubernetes Service Account [Workload
 Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)
 annotations.
 
-Enabel external wif auth
+Optuonal, enable [external wif auth](external-wif.md)
 
-```yaml
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: app-secrets
-spec:
-  provider: gcp
-  parameters:
-    wif.audience: my-audience
-    wif.mode: external
-    secrets: |
-      ...
-```
 
 ## `provider-adc` - GCP Provider Identity
 

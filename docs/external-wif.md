@@ -56,35 +56,6 @@ The logging verbosity can be controlled to provide different levels of detail:
 - **Detailed logs (level 3-4)**: Shows more information about token exchange, configuration details, and non-critical warnings
 - **Debug logs (level 5+)**: Shows verbose information useful for deep troubleshooting, including detailed token information
 
-### Key Log Points
-
-The provider logs detailed information at each stage of the authentication process:
-
-1. **Authentication Method Detection**:
-   ```
-   "starting token acquisition process" auth_mode="generic-wif" ...
-   ```
-
-2. **Configuration Parsing**:
-   ```
-   "generic WIF configuration parameters" available_params=map[audience:...] ...
-   ```
-
-3. **Audience Resolution**:
-   ```
-   "using audience as-is for WIF" audience="//iam.googleapis.com/..." ...
-   ```
-
-4. **Token Exchange Process**:
-   ```
-   "exchanging Kubernetes ServiceAccount token for GCP identity token" ...
-   "successfully obtained GCP identity token" token_expiry=... ...
-   ```
-
-5. **Service Account Impersonation** (if applicable):
-   ```
-   "exchanging identity token for GCP service account token" gcp_service_account="..." ...
-   ```
 
 ### Troubleshooting with Logs
 
@@ -118,285 +89,15 @@ spec:
   provider: gcp
   parameters:
     auth: "generic-wif"
-    wif.audience: "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/github-provider"
+    wif.audience: "my-jwt-audience"
     secrets: |
       - resourceName: "projects/my-project/secrets/my-secret/versions/latest"
         path: "secret.txt"
 ```
 
-## Troubleshooting
-
-If you encounter issues when using Generic WIF authentication:
-
-1. Check the provider pod logs for detailed error information
-2. Verify your WIF configuration parameters are correct
-3. Ensure your Kubernetes ServiceAccount has been properly configured with WIF
-4. Confirm that IAM permissions are properly set for the target GCP service account 
-
-## Deployment Examples
-
-This section provides practical examples for deploying applications that use Generic WIF for accessing GCP Secret Manager secrets using common Kubernetes deployment tools.
-
-### Helm Chart Example
-
-Below is an example of how to structure a Helm chart that uses the Generic WIF authentication method to mount GCP secrets.
-
-#### Directory Structure
-
-```
-my-app/
-├── Chart.yaml
-├── templates/
-│   ├── deployment.yaml
-│   ├── service.yaml
-│   ├── serviceaccount.yaml
-│   └── secretproviderclass.yaml
-└── values.yaml
-```
-
-#### secretproviderclass.yaml
-
-```yaml
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: {{ include "my-app.fullname" . }}-gcp-secrets
-spec:
-  provider: gcp
-  parameters:
-    auth: "generic-wif"
-    wif.audience: {{ .Values.secrets.wif.audience | quote }}
-    {{- if .Values.secrets.wif.tokenUrl }}
-    wif.token_url: {{ .Values.secrets.wif.tokenUrl | quote }}
-    {{- end }}
-    {{- if .Values.secrets.wif.credentialSource }}
-    wif.credential_source: {{ .Values.secrets.wif.credentialSource | quote }}
-    {{- end }}
-    secrets: |
-      {{- range .Values.secrets.items }}
-      - resourceName: "projects/{{ $.Values.secrets.projectId }}/secrets/{{ .name }}/versions/{{ .version | default "latest" }}"
-        path: "{{ .path }}"
-        {{- if .mode }}
-        mode: {{ .mode }}
-        {{- end }}
-      {{- end }}
-```
-
-#### serviceaccount.yaml
-
-```yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {{ include "my-app.serviceAccountName" . }}
-  {{- if .Values.serviceAccount.annotations }}
-  annotations:
-    {{- toYaml .Values.serviceAccount.annotations | nindent 4 }}
-  {{- end }}
-```
-
-#### deployment.yaml (relevant parts)
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ include "my-app.fullname" . }}
-spec:
-  {{- if not .Values.autoscaling.enabled }}
-  replicas: {{ .Values.replicaCount }}
-  {{- end }}
-  selector:
-    matchLabels:
-      {{- include "my-app.selectorLabels" . | nindent 6 }}
-  template:
-    metadata:
-      labels:
-        {{- include "my-app.selectorLabels" . | nindent 8 }}
-    spec:
-      serviceAccountName: {{ include "my-app.serviceAccountName" . }}
-      volumes:
-        - name: secrets-store-inline
-          csi:
-            driver: secrets-store.csi.k8s.io
-            readOnly: true
-            volumeAttributes:
-              secretProviderClass: {{ include "my-app.fullname" . }}-gcp-secrets
-      containers:
-        - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          volumeMounts:
-            - name: secrets-store-inline
-              mountPath: "/mnt/secrets-store"
-              readOnly: true
-          env:
-            - name: SECRET_PATH
-              value: "/mnt/secrets-store/{{ index .Values.secrets.items 0 "path" }}"
-```
-
-#### values.yaml
-
-```yaml
-replicaCount: 1
-
-image:
-  repository: nginx
-  pullPolicy: IfNotPresent
-  tag: ""
-
-serviceAccount:
-  create: true
-  annotations: {}
-  name: ""
-
-secrets:
-  projectId: "my-gcp-project"
-  wif:
-    audience: "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider"
-    # Optional values
-    # tokenUrl: "https://sts.googleapis.com/v1/token"
-    # credentialSource: "file:/var/run/secrets/tokens/gcp-ksa/token"
-  items:
-    - name: "app-secret"
-      version: "latest"
-      path: "app-secret.txt"
-    - name: "db-password"
-      version: "latest"
-      path: "db-password.txt"
-      mode: 0400
-```
-
-### Kustomize Example
-
-For Kustomize, you can structure your configuration as follows:
-
-#### Directory Structure
-
-```
-my-app/
-├── base/
-│   ├── kustomization.yaml
-│   ├── deployment.yaml
-│   ├── service.yaml
-│   ├── serviceaccount.yaml
-│   └── secretproviderclass.yaml
-└── overlays/
-    ├── dev/
-    │   ├── kustomization.yaml
-    │   └── secrets-patch.yaml
-    └── prod/
-        ├── kustomization.yaml
-        └── secrets-patch.yaml
-```
-
-#### base/secretproviderclass.yaml
-
-```yaml
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: my-app-gcp-secrets
-spec:
-  provider: gcp
-  parameters:
-    auth: "generic-wif"
-    # These will be patched in the overlay
-    wif.audience: "TO_BE_REPLACED"
-    secrets: |
-      - resourceName: "projects/PROJECT_ID/secrets/SECRET_NAME/versions/latest"
-        path: "secret.txt"
-```
-
-#### base/deployment.yaml (relevant parts)
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: my-app
-  template:
-    metadata:
-      labels:
-        app: my-app
-    spec:
-      serviceAccountName: my-app-sa
-      volumes:
-        - name: secrets-store-inline
-          csi:
-            driver: secrets-store.csi.k8s.io
-            readOnly: true
-            volumeAttributes:
-              secretProviderClass: my-app-gcp-secrets
-      containers:
-        - name: my-app
-          image: my-app:latest
-          volumeMounts:
-            - name: secrets-store-inline
-              mountPath: "/mnt/secrets-store"
-              readOnly: true
-```
-
-#### base/serviceaccount.yaml
-
-```yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: my-app-sa
-```
-
-#### base/kustomization.yaml
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-- deployment.yaml
-- service.yaml
-- serviceaccount.yaml
-- secretproviderclass.yaml
-```
-
-#### overlays/dev/secrets-patch.yaml
-
-```yaml
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: my-app-gcp-secrets
-spec:
-  parameters:
-    wif.audience: "//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/dev-pool/providers/my-provider"
-    secrets: |
-      - resourceName: "projects/my-dev-project/secrets/app-secret/versions/latest"
-        path: "app-secret.txt"
-      - resourceName: "projects/my-dev-project/secrets/db-password/versions/latest"
-        path: "db-password.txt"
-```
-
-#### overlays/dev/kustomization.yaml
-
-```yaml
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-resources:
-- ../../base
-
-patchesStrategicMerge:
-- secrets-patch.yaml
-
-namePrefix: dev-
-```
-
 ### Step-by-Step Implementation Guide
+
+More info at [workload-identity-federation-with-kubernetes](https://cloud.google.com/iam/docs/workload-identity-federation-with-kubernetes#kubernetes)
 
 Here's a complete walkthrough for implementing Generic WIF with a Helm chart:
 
@@ -414,13 +115,20 @@ Here's a complete walkthrough for implementing Generic WIF with a Helm chart:
      --display-name="My Kubernetes Pool"
 
    # Create a Workload Identity Provider
-   gcloud iam workload-identity-pools providers create-oidc "my-provider" \
+   gcloud iam workload-identity-pools providers create-oidc "my-k8s-cluster" \
      --project="my-project" \
      --location="global" \
      --workload-identity-pool="my-pool" \
-     --attribute-mapping="google.subject=assertion.sub,attribute.namespace=assertion.namespace" \
-     --issuer-uri="https://kubernetes.default.svc.cluster.local"
+     --attribute-mapping="google.subject=assertion.sub,\
+        attribute.namespace=assertion['kubernetes.io']['namespace'],\
+        attribute.service_account_name=assertion['kubernetes.io']['serviceaccount']['name'],\
+        attribute.pod=assertion['kubernetes.io']['pod']['name']" \
+     --issuer-uri="https://kubernetes.default.svc.cluster.local" \
+     --allowed-audiences="my-jwt-audience" \
+     --jwk-json-path=PATH_TO_JWKS_FILE
    ```
+
+   **Note** To get JWKS_FILE do a request to k8s api, like `curl --request GET  https://<K8S_API>/openid/v1/jwks -H "Accept: application/jwk-set+json" -H "Authorization: Bearer MY_K8S_TOKEN"`
 
 3. **Grant Access to the GCP Secret**:
    ```bash
@@ -432,14 +140,14 @@ Here's a complete walkthrough for implementing Generic WIF with a Helm chart:
    # Grant Secret Manager access to the service account
    gcloud secrets add-iam-policy-binding "my-secret" \
      --project="my-project" \
-     --member="serviceAccount:my-gcp-sa@my-project.iam.gserviceaccount.com" \
+     --member="principalSet://iam.googleapis.com/PROJECT_NUMBER/subject/system:serviceaccount:default:my-app-sa" \
      --role="roles/secretmanager.secretAccessor"
 
-   # Allow workload identity pool to impersonate the service account
+   # Allow workload identity pool to impersonate the service account (optional)
    gcloud iam service-accounts add-iam-policy-binding "my-gcp-sa@my-project.iam.gserviceaccount.com" \
      --project="my-project" \
      --role="roles/iam.workloadIdentityUser" \
-     --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/my-pool/attribute.namespace/default"
+     --member="principalSet://iam.googleapis.com/PROJECT_NUMBER/subject/system:serviceaccount:default:my-app-sa"
    ```
 
 4. **Create Kubernetes ServiceAccount and Annotations**:
@@ -451,26 +159,6 @@ Here's a complete walkthrough for implementing Generic WIF with a Helm chart:
      name: my-app-sa
      namespace: default
      annotations:
-       # If using service account impersonation, add this annotation
+       # If using service account impersonation, add this annotation (optional)
        iam.gke.io/gcp-service-account: my-gcp-sa@my-project.iam.gserviceaccount.com
    ```
-
-5. **Deploy the Helm Chart**:
-   ```bash
-   # Update values.yaml with your specific settings
-   helm install my-app ./my-app \
-     --set secrets.projectId=my-project \
-     --set secrets.wif.audience="//iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider"
-   ```
-
-6. **Verify Secret Mounting**:
-   ```bash
-   # Get a shell into your pod
-   kubectl exec -it deploy/my-app -- /bin/sh
-   
-   # Check if the secrets are properly mounted
-   ls -la /mnt/secrets-store/
-   cat /mnt/secrets-store/app-secret.txt
-   ```
-
-This comprehensive guide should help you implement Generic WIF authentication with Helm or Kustomize for your applications that need to access GCP Secret Manager. 

@@ -1,25 +1,24 @@
-nameOverride: ""
 
 serviceAccount:
   annotations: {}
-  name: secrets-store-csi-driver-provider-gcp
+  name: ""
 
+extraArgs: []
+logLevel: 0
 image:
-  repository: us-docker.pkg.dev/secretmanager-csi/secrets-store-csi-driver-provider-gcp/plugin
+  repository: zondax/secrets-store-csi-driver-provider-gcp
   pullPolicy: IfNotPresent
-  hash: sha256:16206089381c7f9b70442b4ed97e65bc34daec1ee26a5c5de7453a24f0f1de13
-
-app: csi-secrets-store-provider-gcp
+  tag: ""
 
 podAnnotations: {}
 
 resources:
   requests:
-    cpu: 50m
-    memory: 100Mi
+    cpu: 100m
+    memory: 128Mi
   limits:
     cpu: 50m
-    memory: 100Mi
+    memory: 64Mi
 
 priorityClassName: ""
 
@@ -29,3 +28,9 @@ nodeSelector:
 tolerations: []
 
 affinity: {}
+
+adc:
+  enabled: false
+  path: /var/gcp
+  keyName: gcp-sa-credential.json
+  data: ""

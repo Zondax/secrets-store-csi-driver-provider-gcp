@@ -1,0 +1,10 @@
+# Release
+/dist
+secrets-store-csi-driver-provider-gcp
+
+# Misc
+.DS_Store
+.idea/*
+.vscode/*
+cover.out
+**/output

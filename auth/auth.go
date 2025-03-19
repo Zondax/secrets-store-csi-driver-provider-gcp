@@ -50,11 +50,11 @@ import (
 )
 
 const (
-	cloudScope                  = "https://www.googleapis.com/auth/cloud-platform"
-	adcEnvVar                   = "GOOGLE_APPLICATION_CREDENTIALS"
-	adcWellKnown                = "application_default_credentials.json"
-	adcImpersonationAnnotation  = "iam.gke.io/gcp-service-account"
-	adcImpersonationURL         = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts"
+	cloudScope                 = "https://www.googleapis.com/auth/cloud-platform"
+	adcEnvVar                  = "GOOGLE_APPLICATION_CREDENTIALS"
+	adcWellKnown               = "application_default_credentials.json"
+	adcImpersonationAnnotation = "iam.gke.io/gcp-service-account"
+	adcImpersonationURL        = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts"
 )
 
 type Client struct {
@@ -71,8 +71,8 @@ const (
 
 // credentialsFile is the unmarshalled representation of a credentials file.
 type credentialsFile struct {
-	Type 			string `json:"type"`
-	UniverseDomain 	string `json:"universe_domain"`
+	Type           string `json:"type"`
+	UniverseDomain string `json:"universe_domain"`
 
 	// External Account fields
 	Audience                       string                           `json:"audience"`
@@ -93,7 +93,7 @@ type credentialsFile struct {
 }
 
 type K8STokenSupplier struct {
-	token     string
+	token string
 }
 
 func (c *K8STokenSupplier) SubjectToken(ctx context.Context, options externalaccount.SupplierOptions) (string, error) {
@@ -157,17 +157,17 @@ func (c *Client) externalTokenSource(ctx context.Context, podInfo *config.PodInf
 
 	// Generating external account config with SA token
 	config := externalaccount.Config{
-		Audience: credFile.Audience,
+		Audience:         credFile.Audience,
 		SubjectTokenType: credFile.SubjectTokenType,
-		TokenURL: credFile.TokenURLExternal,
-		TokenInfoURL: credFile.TokenInfoURL,
+		TokenURL:         credFile.TokenURLExternal,
+		TokenInfoURL:     credFile.TokenInfoURL,
 		//ServiceAccountImpersonationURL: credFile.ServiceAccountImpersonationURL,
 		//ServiceAccountImpersonationLifetimeSeconds: credFile.ServiceAccountImpersonationLifetimeSeconds,
 		//ClientSecret: credFile.ClientSecret,
 		//ClientID: credFile.ClientID,
 		//CredentialSource *CredentialSource
-		QuotaProjectID: credFile.QuotaProjectID,
-		Scopes: []string{cloudScope},
+		QuotaProjectID:           credFile.QuotaProjectID,
+		Scopes:                   []string{cloudScope},
 		WorkforcePoolUserProject: credFile.WorkforcePoolUserProject,
 		// Setting K8STokenSupplier with SA token
 		SubjectTokenSupplier: &K8STokenSupplier{
@@ -349,7 +349,7 @@ func (c *Client) getPodSAToken(ctx context.Context, podinfo *config.PodInfo, aud
 
 func (c *Client) extractPodSAToken(podinfo *config.PodInfo, audience string) (*authenticationv1.TokenRequestStatus, error) {
 	klog.V(5).InfoS("extracting SA token from driver-provided tokens",
-			"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name})
+		"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name})
 
 	audienceTokens := map[string]authenticationv1.TokenRequestStatus{}
 	if err := json.Unmarshal([]byte(podinfo.ServiceAccountTokens), &audienceTokens); err != nil {
@@ -365,7 +365,7 @@ func (c *Client) extractPodSAToken(podinfo *config.PodInfo, audience string) (*a
 
 func (c *Client) generatePodSAToken(ctx context.Context, podinfo *config.PodInfo, audience string) (*authenticationv1.TokenRequestStatus, error) {
 	klog.V(5).InfoS("generating SA token from driver-provided tokens",
-			"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name})
+		"pod", klog.ObjectRef{Namespace: podinfo.Namespace, Name: podinfo.Name})
 
 	ttl := int64((15 * time.Minute).Seconds())
 	resp, err := c.KubeClient.CoreV1().
@@ -556,7 +556,7 @@ func wellKnownFile() string {
 	return fmt.Sprintf("%s/.config/gcloud/%s", home, adcWellKnown)
 }
 
-func credentialFileFromENV(ctx context.Context) (*credentialsFile, error)  {
+func credentialFileFromENV(ctx context.Context) (*credentialsFile, error) {
 	filename := os.Getenv(adcEnvVar)
 	if filename == "" {
 		// Second, try a well-known file.
@@ -572,7 +572,7 @@ func credentialFileFromENV(ctx context.Context) (*credentialsFile, error)  {
 	return credentialFileFromJSON(ctx, jsonData)
 }
 
-func credentialFileFromJSON(ctx context.Context, jsonData []byte) (*credentialsFile, error)  {
+func credentialFileFromJSON(ctx context.Context, jsonData []byte) (*credentialsFile, error) {
 	credFile := &credentialsFile{}
 	if err := json.Unmarshal(jsonData, &credFile); err != nil {
 		return nil, fmt.Errorf("google: error parsing credentials from well known files: %v", err)
