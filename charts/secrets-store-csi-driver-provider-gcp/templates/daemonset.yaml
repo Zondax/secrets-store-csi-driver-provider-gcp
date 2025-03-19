@@ -1,8 +1,7 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "secrets-store-csi-driver-provider-gcp.daemonSetName" . }}
-  namespace: kube-system
+  name: {{ include "secrets-store-csi-driver-provider-gcp.fullname" . }}
   labels:
     {{- include "secrets-store-csi-driver-provider-gcp.labels" . | nindent 4 }}
 spec:
@@ -39,8 +38,15 @@ spec:
       {{- end }}
       containers:
         - name: provider
-          image: "{{ .Values.image.repository }}@{{ .Values.image.hash }}"
+          image: {{ .Values.image.repository }}:{{ or .Values.image.tag (printf "v%s" .Chart.AppVersion) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --log-level={{ .Values.logLevel }}
+          {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command:
+            - /usr/local/bin/secrets-store-csi-driver-provider-gcp
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
@@ -56,11 +62,20 @@ spec:
           env:
             - name: TARGET_DIR
               value: "/etc/kubernetes/secrets-store-csi-providers"
+          {{- if .Values.adc.enabled }}
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+            value: {{ .Values.adc.path }}/{{ .Values.adc.keyName }}
+          {{- end }}
           volumeMounts:
             - mountPath: "/etc/kubernetes/secrets-store-csi-providers"
               name: providervol
               mountPropagation: None
               readOnly: false
+          {{- if .Values.adc.enabled }}
+            - mountPath: {{ .Values.adc.path }}
+              name: adc-credentials
+              readOnly: true
+          {{- end }}
           livenessProbe:
             failureThreshold: 3
             httpGet:
@@ -73,6 +88,12 @@ spec:
         - name: providervol
           hostPath:
             path: /etc/kubernetes/secrets-store-csi-providers
+      {{- if .Values.adc.enabled }}
+        - configMap:
+            defaultMode: 420
+            name: {{ include "secrets-store-csi-driver-provider-gcp.fullname" . }}-adc
+          name: adc-credentials
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

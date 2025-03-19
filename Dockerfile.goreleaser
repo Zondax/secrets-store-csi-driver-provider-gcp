@@ -1,0 +1,8 @@
+FROM gcr.io/distroless/static:nonroot
+
+#COPY licenses/ /licenses/
+COPY secrets-store-csi-driver-provider-gcp /usr/local/bin/secrets-store-csi-driver-provider-gcp
+
+USER 65532:65532
+
+ENTRYPOINT ["/usr/local/bin/secrets-store-csi-driver-provider-gcp"] 

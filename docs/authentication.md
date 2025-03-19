@@ -13,6 +13,9 @@ a Google authentication token using the Kubernetes Service Account [Workload
 Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)
 annotations.
 
+Optuonal, enable [external wif auth](external-wif.md)
+
+
 ## `provider-adc` - GCP Provider Identity
 
 In the `SecretProviderClass` you can set
